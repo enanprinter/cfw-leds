@@ -34,9 +34,9 @@ COMFAST CF-WA350 firmware for the three external LEDs:
 On this DSA-based device the WAN/LAN rates are read from the QCA8337
 hardware MIB counters (RxGoodByte/TxByte) via ethtool, so traffic
 forwarded in hardware by the DSA bridge offload is counted as well;
-the 2.4 GHz LED follows the phy1-ap0 kernel counters. The daemon
-takes exclusive ownership of blue:ext_wan, blue:ext_lan and
-blue:ext_wlan2g; the internal LEDs remain with /etc/init.d/led.
+the 2.4 GHz LED follows the on-board 2.4 GHz radio's netdevs. The daemon
+takes exclusive ownership of blue:ext-wan, blue:ext-lan and
+blue:ext-wlan2g; the internal LEDs remain with /etc/init.d/led.
 endef
 
 define Build/Compile

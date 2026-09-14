@@ -35,7 +35,7 @@ service_stopped() {
 	board_match || return 0
 
 	# Set external LEDs to solid on (brightness 1)
-	for led in blue:ext_wan blue:ext_lan blue:ext_wlan2g; do
+	for led in blue:ext-wan blue:ext-lan blue:ext-wlan2g; do
 		[ -e "/sys/class/leds/$led/trigger" ] && echo none > "/sys/class/leds/$led/trigger" 2>/dev/null
 		[ -e "/sys/class/leds/$led/brightness" ] && echo 1 > "/sys/class/leds/$led/brightness" 2>/dev/null
 	done

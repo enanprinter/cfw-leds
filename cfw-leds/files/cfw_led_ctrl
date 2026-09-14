@@ -22,8 +22,10 @@
 #     to the kernel netdev counters in /sys. This is the same counter source
 #     the stock firmware used. If ethtool or the MIB counters are unavailable
 #     the daemon automatically falls back to the kernel counters.
-#   - WLAN (2.4 GHz, phy1-ap0): kernel netdev counters (wireless traffic
-#     always passes the CPU).
+#   - WLAN (2.4 GHz): kernel netdev counters of every interface currently
+#     attached to the on-board 2.4 GHz radio, derived at runtime from
+#     /sys/class/net/*/phy80211 (AP, STA, mesh and renamed interfaces
+#     all covered; wireless traffic always passes the CPU).
 #   - Link state: carrier of each DSA port netdev.
 #
 # Pure POSIX shell (busybox ash compatible). Runtime dependency: ethtool.
@@ -33,27 +35,17 @@ LEDS_ROOT="${LEDS_ROOT:-/sys/class/leds}"
 NET_ROOT="${NET_ROOT:-/sys/class/net}"
 
 #========================== device settings ===================================
-WAN_LED="${WAN_LED:-blue:ext_wan}"
-LAN_LED="${LAN_LED:-blue:ext_lan}"
-WLAN_LED="${WLAN_LED:-blue:ext_wlan2g}"
+WAN_LED="${WAN_LED:-blue:ext-wan}"
+LAN_LED="${LAN_LED:-blue:ext-lan}"
+WLAN_LED="${WLAN_LED:-blue:ext-wlan2g}"
 
 WAN_IF="${WAN_IF:-wan}"          # DSA netdev of switch port 1 (WAN jack)
 LAN_IF="${LAN_IF:-lan}"          # DSA netdev of switch port 2 (LAN jack)
-WLAN_IF_LIST="${WLAN_IF_LIST-phy1-ap0}"
 
 IDLE_KBPS="${IDLE_KBPS:-16}"     # below this rate (KiB/s) traffic counts as idle
 HOLDOVER="${HOLDOVER:-20}"       # afterglow duration in seconds (10-30)
 USE_ETHTOOL="${USE_ETHTOOL:-1}"  # 1 = read switch MIB via ethtool, 0 = kernel only
 #===============================================================================
-
-# Pick the first existing interface from a list.
-pick_if() {
-	for _i in $1; do
-		[ -e "$NET_ROOT/$_i/statistics/rx_bytes" ] && { echo "$_i"; return 0; }
-	done
-	echo ""
-	return 1
-}
 
 # Kernel netdev counters -> IB_KB (KiB), or -1 if the interface is absent.
 # Each operand is scaled down before the addition to stay safe on 32-bit
@@ -87,6 +79,38 @@ if_carrier_up() {
 	[ -e "$NET_ROOT/$1/carrier" ] || return 1
 	read _c < "$NET_ROOT/$1/carrier" 2>/dev/null || _c=0
 	[ "$_c" = "1" ]
+}
+
+# Current netdevs of the on-board 2.4 GHz radio: any interface whose
+# phy80211 symlink does not resolve to a PCI device (the 5 GHz card).
+wlan_ifs() {
+	for _p in "$NET_ROOT"/*/phy80211; do
+		[ -e "$_p" ] || continue
+		case "$(readlink -f "$_p" 2>/dev/null)" in
+		*pci*) continue ;;
+		esac
+		_n=${_p%/phy80211}
+		echo "${_n##*/}"
+	done
+}
+
+wlan_link() { # 1 if any 2.4 GHz netdev has carrier
+	for _i in $(wlan_ifs); do
+		if_carrier_up "$_i" && return 0
+	done
+	return 1
+}
+
+wlan_bytes() { # KiB summed over all 2.4 GHz netdevs; -1 if none exist
+	_s=0; _found=0
+	for _i in $(wlan_ifs); do
+		if read _r < "$NET_ROOT/$_i/statistics/rx_bytes" 2>/dev/null \
+		   && read _t < "$NET_ROOT/$_i/statistics/tx_bytes" 2>/dev/null; then
+			_s=$(( _s + _r / 1024 + _t / 1024 ))
+			_found=1
+		fi
+	done
+	[ "$_found" = 1 ] && IB_KB=$_s || IB_KB=-1
 }
 
 # Apply an LED state: off / on / <blink half-period in ms> (kernel timer trigger).
@@ -166,7 +190,7 @@ leds_disabled() {
 
 #------------------------- initialization --------------------------------------
 
-WLAN_IF=$(pick_if "$WLAN_IF_LIST")
+WLAN_IFS=$(wlan_ifs | tr '\n' ' ')
 
 # Detect the counter source: qca8k exposes RxGoodByte/TxByte via ethtool -S.
 ETHTOOL_MODE=0
@@ -191,11 +215,11 @@ for _i in "$WAN_IF" "$LAN_IF"; do
 done
 
 if [ "$ETHTOOL_MODE" = 1 ]; then SRC="switch MIB (ethtool)"; else SRC="kernel counters"; fi
-logger -t cfw_leds "started: WAN='$WAN_LED'($WAN_IF) LAN='$LAN_LED'($LAN_IF) WLAN='$WLAN_LED'($WLAN_IF) src=$SRC holdover=${HOLDOVER}s idle=${IDLE_KBPS}KiB/s"
+logger -t cfw_leds "started: WAN='$WAN_LED'($WAN_IF) LAN='$LAN_LED'($LAN_IF) WLAN='$WLAN_LED'($WLAN_IFS) src=$SRC holdover=${HOLDOVER}s idle=${IDLE_KBPS}KiB/s"
 
-cleanup() {
+cleanup() { # leave the LEDs in the same defined state the init uses
 	for _l in "$WAN_LED" "$LAN_LED" "$WLAN_LED"; do
-		set_led_mode "$_l" off
+		set_led_mode "$_l" on
 	done
 	logger -t cfw_leds "stopped"
 	exit 0
@@ -212,18 +236,20 @@ WAN_PEAK=0; WAN_AG=0; WAN_LASTRD=0
 LAN_PEAK=0; LAN_AG=0; LAN_LASTRD=0
 WLAN_PEAK=0; WLAN_AG=0; WLAN_LASTRD=0
 DC=0
+LEDS_OFF=0
 
 while :; do
 	DC=$(( DC + 1 ))
 
-	# Vendor "LEDs off" mode (checked every ~5 s).
-	if [ $(( DC % 5 )) -eq 1 ] && leds_disabled; then
+	# Vendor "LEDs off" mode (re-read every ~5 s, enforced each iteration).
+	[ $(( DC % 5 )) -eq 1 ] && { leds_disabled && LEDS_OFF=1 || LEDS_OFF=0; }
+	if [ "$LEDS_OFF" = 1 ]; then
 		for _l in "$WAN_LED" "$LAN_LED" "$WLAN_LED"; do
 			set_led_mode "$_l" off
 		done
 		WAN_STATE="OFFD"; LAN_STATE="OFFD"; WLAN_STATE="OFFD"
 		WAN_PEAK=0; WAN_AG=0; LAN_PEAK=0; LAN_AG=0; WLAN_PEAK=0; WLAN_AG=0
-		sleep 5
+		sleep 1
 		FIRST=1
 		continue
 	fi
@@ -231,13 +257,12 @@ while :; do
 	# Link state straight from each DSA port carrier.
 	if if_carrier_up "$WAN_IF"; then WAN_LINK=1; else WAN_LINK=0; fi
 	if if_carrier_up "$LAN_IF"; then LAN_LINK=1; else LAN_LINK=0; fi
-	WLAN_IF=$(pick_if "$WLAN_IF_LIST")
-	if if_carrier_up "$WLAN_IF"; then WLAN_LINK=1; else WLAN_LINK=0; fi
+	if wlan_link; then WLAN_LINK=1; else WLAN_LINK=0; fi
 
 	# Counters: hardware MIB for switch ports, kernel counters for WLAN.
 	mib_bytes "$WAN_IF";  CW=$IB_KB; [ $CW -lt 0 ] && CW=0
 	mib_bytes "$LAN_IF";  CL=$IB_KB; [ $CL -lt 0 ] && CL=0
-	sys_bytes "$WLAN_IF"; C1=$IB_KB; [ $C1 -lt 0 ] && C1=0
+	wlan_bytes; C1=$IB_KB; [ $C1 -lt 0 ] && C1=0
 
 	if [ $FIRST = 1 ]; then
 		P_WAN=$CW; P_LAN=$CL; P_WL=$C1
