@@ -59,17 +59,24 @@ sys_bytes() {
 	fi
 }
 
-# Hardware MIB counters of a switch port -> IB_KB, with automatic fallback
-# to the kernel counters when ethtool is unavailable or the interface has
-# no RxGoodByte/TxByte statistics (e.g. wireless).
-mib_bytes() {
+# Hardware MIB counters of a switch port -> IB_KB. The counter source is
+# latched at startup; a transient ethtool failure repeats the last good
+# total so deltas never mix the MIB and kernel counter bases. Falls back
+# to kernel counters only when ethtool was absent at startup.
+mib_bytes() { # $1 = netdev, $2 = tag (WAN|LAN); KiB into IB_KB
+	IB_KB=-1
 	if [ "$ETHTOOL_MODE" = 1 ]; then
 		_p=$(ethtool -S "$1" 2>/dev/null | awk \
 			'/RxGoodByte:/{rx=$2} /TxByte:/{tx=$2} END{if(rx!=""&&tx!="")printf "%d",(rx+tx)/1024}')
 		if [ -n "$_p" ]; then
 			IB_KB=$_p
+			if [ "$2" = WAN ]; then LAST_MIB_WAN=$_p; else LAST_MIB_LAN=$_p; fi
 			return
 		fi
+		# Transient ethtool failure: repeat the last good total so the
+		# delta stays zero instead of mixing counter bases.
+		if [ "$2" = WAN ]; then IB_KB=$LAST_MIB_WAN; else IB_KB=$LAST_MIB_LAN; fi
+		return
 	fi
 	sys_bytes "$1"
 }
@@ -94,16 +101,16 @@ wlan_ifs() {
 	done
 }
 
-wlan_link() { # 1 if any 2.4 GHz netdev has carrier
-	for _i in $(wlan_ifs); do
+wlan_link() { # $1 = 2.4 GHz netdev list; 1 if any has carrier
+	for _i in $1; do
 		if_carrier_up "$_i" && return 0
 	done
 	return 1
 }
 
-wlan_bytes() { # KiB summed over all 2.4 GHz netdevs; -1 if none exist
+wlan_bytes() { # $1 = list; KiB summed over 2.4 GHz netdevs; -1 if none
 	_s=0; _found=0
-	for _i in $(wlan_ifs); do
+	for _i in $1; do
 		if read _r < "$NET_ROOT/$_i/statistics/rx_bytes" 2>/dev/null \
 		   && read _t < "$NET_ROOT/$_i/statistics/tx_bytes" 2>/dev/null; then
 			_s=$(( _s + _r / 1024 + _t / 1024 ))
@@ -180,12 +187,9 @@ group_mode() {
 	M=on; G_PEAK=0; G_AG=0; G_LASTRD=0
 }
 
-# Vendor "LEDs off" feature (/etc/led_off file or led.led_off uci flag).
+# Vendor "LEDs off" feature (/etc/led_off flag file).
 leds_disabled() {
-	[ -e /etc/led_off ] && return 0
-	_v=$(uci -q get led.led_off 2>/dev/null)
-	[ "$_v" = "1" ] && return 0
-	return 1
+	[ -e /etc/led_off ]
 }
 
 #------------------------- initialization --------------------------------------
@@ -237,16 +241,19 @@ LAN_PEAK=0; LAN_AG=0; LAN_LASTRD=0
 WLAN_PEAK=0; WLAN_AG=0; WLAN_LASTRD=0
 DC=0
 LEDS_OFF=0
+LAST_MIB_WAN=0; LAST_MIB_LAN=0
 
 while :; do
 	DC=$(( DC + 1 ))
 
-	# Vendor "LEDs off" mode (re-read every ~5 s, enforced each iteration).
+	# Vendor "LEDs off" mode (re-read every ~5 s, applied on transition).
 	[ $(( DC % 5 )) -eq 1 ] && { leds_disabled && LEDS_OFF=1 || LEDS_OFF=0; }
 	if [ "$LEDS_OFF" = 1 ]; then
-		for _l in "$WAN_LED" "$LAN_LED" "$WLAN_LED"; do
-			set_led_mode "$_l" off
-		done
+		if [ "$WAN_STATE" != "OFFD" ]; then
+			for _l in "$WAN_LED" "$LAN_LED" "$WLAN_LED"; do
+				set_led_mode "$_l" off
+			done
+		fi
 		WAN_STATE="OFFD"; LAN_STATE="OFFD"; WLAN_STATE="OFFD"
 		WAN_PEAK=0; WAN_AG=0; LAN_PEAK=0; LAN_AG=0; WLAN_PEAK=0; WLAN_AG=0
 		sleep 1
@@ -257,12 +264,13 @@ while :; do
 	# Link state straight from each DSA port carrier.
 	if if_carrier_up "$WAN_IF"; then WAN_LINK=1; else WAN_LINK=0; fi
 	if if_carrier_up "$LAN_IF"; then LAN_LINK=1; else LAN_LINK=0; fi
-	if wlan_link; then WLAN_LINK=1; else WLAN_LINK=0; fi
+	WLAN_NOW=$(wlan_ifs)
+	if wlan_link "$WLAN_NOW"; then WLAN_LINK=1; else WLAN_LINK=0; fi
 
 	# Counters: hardware MIB for switch ports, kernel counters for WLAN.
-	mib_bytes "$WAN_IF";  CW=$IB_KB; [ $CW -lt 0 ] && CW=0
-	mib_bytes "$LAN_IF";  CL=$IB_KB; [ $CL -lt 0 ] && CL=0
-	wlan_bytes; C1=$IB_KB; [ $C1 -lt 0 ] && C1=0
+	mib_bytes "$WAN_IF" WAN; CW=$IB_KB; [ $CW -lt 0 ] && CW=0
+	mib_bytes "$LAN_IF" LAN; CL=$IB_KB; [ $CL -lt 0 ] && CL=0
+	wlan_bytes "$WLAN_NOW"; C1=$IB_KB; [ $C1 -lt 0 ] && C1=0
 
 	if [ $FIRST = 1 ]; then
 		P_WAN=$CW; P_LAN=$CL; P_WL=$C1

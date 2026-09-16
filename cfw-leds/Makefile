@@ -46,7 +46,7 @@ define Package/cfw-leds/install
 	$(INSTALL_DIR) $(1)/usr/bin
 	$(INSTALL_BIN) ./files/cfw_led_ctrl $(1)/usr/bin/cfw_led_ctrl
 	$(INSTALL_DIR) $(1)/etc/init.d
-	$(INSTALL_BIN) ./files/cfw_leds.init $(1)/etc/init.d/cfw_leds
+	$(INSTALL_BIN) ./files/cfw-leds.init $(1)/etc/init.d/cfw-leds
 endef
 
 $(eval $(call BuildPackage,cfw-leds))
